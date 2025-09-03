@@ -19,21 +19,7 @@ app.use(cors({
   credentials: true
 }));
 
-// Rate limiting
-// const limiter = rateLimit({
-//   windowMs: 15 * 60 * 1000, // 15 minutes
-//   max: 100, // limite chaque IP à 100 requêtes par windowMs
-//   message: 'Trop de requêtes depuis cette IP, veuillez réessayer plus tard.'
-// });
-// app.use('/api/', limiter);
 
-// // Rate limiting plus strict pour l'auth
-// const authLimiter = rateLimit({
-//   windowMs: 15 * 60 * 1000,
-//   max: 5, // 5 tentatives de connexion par 15min
-//   message: 'Trop de tentatives de connexion, veuillez réessayer dans 15 minutes.'
-// });
-// app.use('/api/auth/login', authLimiter);
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
