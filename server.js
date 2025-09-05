@@ -1008,26 +1008,7 @@ app.use('*', (req, res) => {
 const startServer = async () => {
   try {
     await testConnection();
-    async function testDatabaseConnection() {
-  try {
-    const connection = await mysql.createConnection({
-      host: process.env.DB_HOST,
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD,
-      database: process.env.DB_NAME,
-      port: process.env.DB_PORT,
-      connectTimeout: 10000, // 10 secondes
-    });
-    await connection.connect();
-    console.log("✅ Connexion à Railway réussie depuis Render !");
-    await connection.end();
-  } catch (error) {
-    console.error("❌ Échec de la connexion à Railway :", error.message);
-    if (error.code === 'ETIMEDOUT') {
-      console.error("Le serveur Render ne parvient pas à joindre Railway. Vérifiez le proxy ou le pare-feu.");
-    }
-  }
-}
+
 
 testDatabaseConnection();
     app.listen(port, () => {
