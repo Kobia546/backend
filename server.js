@@ -1935,9 +1935,22 @@ app.use('*', (req, res) => {
 });
 
 // Démarrage du serveur
-app.listen(2025, '0.0.0.0', () => {
-  console.log("Serveur démarré sur http://0.0.0.0:2025");
-});
+const startServer = async () => {
+  try {
+    await testConnection();
+
+
+testDatabaseConnection();
+    app.listen(port, () => {
+      console.log(`🚀 Serveur démarré sur le port ${port}`);
+      console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`🔗 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+    });
+  } catch (error) {
+    console.error('❌ Erreur de démarrage:', error);
+    process.exit(1);
+  }
+};
 
 // Gestion propre de l'arrêt
 process.on('SIGINT', async () => {
@@ -1946,3 +1959,5 @@ process.on('SIGINT', async () => {
   console.log('✅ Connexions fermées');
   process.exit(0);
 });
+
+startServer();
