@@ -1940,7 +1940,7 @@ const startServer = async () => {
     await testConnection();
 
 
-testDatabaseConnection();
+
     app.listen(port, () => {
       console.log(`🚀 Serveur démarré sur le port ${port}`);
       console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
