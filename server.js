@@ -51,7 +51,7 @@ const pool = mysql.createPool({
   acquireTimeout: 60000,
   timeout: 60000,
   reconnect: true,
-  idleTimeout: 300000,
+  idleTimeout: 3000000000,
   enableKeepAlive: true,
   keepAliveInitialDelay: 0
 });
@@ -419,6 +419,264 @@ app.post('/api/products', authenticateToken, async (req, res) => {
     } else {
       handleDatabaseError(error, res, 'Erreur lors de la création du produit');
     }
+  } finally {
+    connection.release();
+  }
+});
+// ===============================================
+// ROUTES CLIENTS
+// ===============================================
+
+// Récupérer tous les clients
+app.get('/api/clients', authenticateToken, async (req, res) => {
+  try {
+    const [clients] = await pool.execute(
+      `SELECT * FROM clients 
+       WHERE company_id = ? 
+       ORDER BY created_at DESC`,
+      [req.user.company_id]
+    );
+    res.json(clients);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des clients');
+  }
+});
+
+// Créer un client
+app.post('/api/clients', authenticateToken, async (req, res) => {
+  try {
+    const { name, phone, address } = req.body;
+    
+    if (!name || !phone) {
+      return res.status(400).json({ error: 'Nom et téléphone requis' });
+    }
+
+    const [result] = await pool.execute(
+      `INSERT INTO clients (company_id, name, phone, address, created_by) 
+       VALUES (?, ?, ?, ?, ?)`,
+      [req.user.company_id, name, phone, address, req.user.id]
+    );
+
+    await logActivity(req.user.company_id, req.user.id, 'client_created', 'client', result.insertId, 
+      { name, phone }, req.ip);
+
+    res.json({ message: 'Client créé avec succès', clientId: result.insertId });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la création du client');
+  }
+});
+
+// Modifier un client
+app.put('/api/clients/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, phone, address } = req.body;
+
+    await pool.execute(
+      `UPDATE clients SET name = ?, phone = ?, address = ?, updated_at = NOW()
+       WHERE id = ? AND company_id = ?`,
+      [name, phone, address, id, req.user.company_id]
+    );
+
+    await logActivity(req.user.company_id, req.user.id, 'client_updated', 'client', id, 
+      { name, phone }, req.ip);
+
+    res.json({ message: 'Client modifié avec succès' });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la modification du client');
+  }
+});
+
+// Supprimer un client
+app.delete('/api/clients/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Vérifier qu'il n'y a pas de commandes en cours
+    const [orders] = await pool.execute(
+      'SELECT COUNT(*) as order_count FROM client_orders WHERE client_id = ? AND status = "pending"',
+      [id]
+    );
+
+    if (orders[0].order_count > 0) {
+      return res.status(400).json({ error: 'Impossible de supprimer un client ayant des commandes en cours' });
+    }
+
+    await pool.execute(
+      'DELETE FROM clients WHERE id = ? AND company_id = ?',
+      [id, req.user.company_id]
+    );
+
+    await logActivity(req.user.company_id, req.user.id, 'client_deleted', 'client', id, 
+      {}, req.ip);
+
+    res.json({ message: 'Client supprimé avec succès' });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la suppression du client');
+  }
+});
+
+// ===============================================
+// ROUTES COMMANDES CLIENTS
+// ===============================================
+
+// Récupérer toutes les commandes clients
+app.get('/api/client-orders', authenticateToken, async (req, res) => {
+  try {
+    const [orders] = await pool.execute(
+      `SELECT co.*, c.name as client_name, c.phone as client_phone, c.address as client_address
+       FROM client_orders co
+       JOIN clients c ON co.client_id = c.id
+       WHERE co.company_id = ? 
+       ORDER BY 
+         CASE WHEN co.status = 'pending' THEN 0 ELSE 1 END,
+         co.due_date ASC, 
+         co.created_at DESC`,
+      [req.user.company_id]
+    );
+
+    // Récupérer les items pour chaque commande
+    for (let order of orders) {
+      const [items] = await pool.execute(
+        `SELECT coi.*, p.name as product_name, p.selling_price as unit_price
+         FROM client_order_items coi
+         LEFT JOIN products p ON coi.product_id = p.id
+         WHERE coi.order_id = ?`,
+        [order.id]
+      );
+      order.items = items;
+    }
+
+    res.json(orders);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des commandes clients');
+  }
+});
+
+// Créer une commande client
+app.post('/api/client-orders', authenticateToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  
+  try {
+    const { client_id, items, total_amount, advance_payment, remaining_amount, due_date } = req.body;
+    
+    if (!client_id || !items || items.length === 0) {
+      return res.status(400).json({ error: 'Client et produits requis' });
+    }
+
+    await connection.beginTransaction();
+
+    // Créer la commande
+    const orderNumber = `CMD-${Date.now()}-${req.user.id}`;
+    
+    const [orderResult] = await connection.execute(
+      `INSERT INTO client_orders (company_id, client_id, order_number, total_amount, 
+       advance_payment, remaining_amount, due_date, created_by) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [req.user.company_id, client_id, orderNumber, total_amount, advance_payment || 0, 
+       remaining_amount, due_date, req.user.id]
+    );
+
+    const orderId = orderResult.insertId;
+
+    // Ajouter les items de la commande
+    for (const item of items) {
+      const [product] = await connection.execute(
+        'SELECT name, selling_price FROM products WHERE id = ? AND company_id = ?',
+        [item.product_id, req.user.company_id]
+      );
+
+      if (product.length === 0) {
+        throw new Error(`Produit ${item.product_id} non trouvé`);
+      }
+
+      await connection.execute(
+        `INSERT INTO client_order_items (order_id, product_id, product_name, quantity, unit_price, line_total) 
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [orderId, item.product_id, product[0].name, item.quantity, product[0].selling_price, 
+         product[0].selling_price * item.quantity]
+      );
+    }
+
+    await connection.commit();
+
+    await logActivity(req.user.company_id, req.user.id, 'client_order_created', 'client_order', orderId, 
+      { orderNumber, total_amount, itemCount: items.length }, req.ip);
+
+    res.json({ message: 'Commande client créée avec succès', orderId, orderNumber });
+
+  } catch (error) {
+    await connection.rollback();
+    
+    if (error.message.includes('non trouvé')) {
+      return res.status(404).json({ error: error.message });
+    } else {
+      handleDatabaseError(error, res, 'Erreur lors de la création de la commande client');
+    }
+  } finally {
+    connection.release();
+  }
+});
+
+// Modifier le statut d'une commande client
+app.put('/api/client-orders/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, payment_amount } = req.body;
+
+    let updateQuery = 'UPDATE client_orders SET status = ?, updated_at = NOW()';
+    let params = [status];
+
+    // Si paiement complémentaire
+    if (payment_amount && status === 'completed') {
+      updateQuery += ', advance_payment = advance_payment + ?, remaining_amount = remaining_amount - ?';
+      params.push(payment_amount, payment_amount);
+    }
+
+    updateQuery += ' WHERE id = ? AND company_id = ?';
+    params.push(id, req.user.company_id);
+
+    await pool.execute(updateQuery, params);
+
+    await logActivity(req.user.company_id, req.user.id, 'client_order_status_updated', 'client_order', id, 
+      { status, payment_amount }, req.ip);
+
+    res.json({ message: 'Statut de la commande modifié avec succès' });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la modification du statut');
+  }
+});
+
+// Supprimer une commande client
+app.delete('/api/client-orders/:id', authenticateToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  
+  try {
+    const { id } = req.params;
+
+    await connection.beginTransaction();
+
+    // Supprimer les items de la commande
+    await connection.execute(
+      'DELETE FROM client_order_items WHERE order_id = ?',
+      [id]
+    );
+
+    // Supprimer la commande
+    await connection.execute(
+      'DELETE FROM client_orders WHERE id = ? AND company_id = ?',
+      [id, req.user.company_id]
+    );
+
+    await connection.commit();
+
+    await logActivity(req.user.company_id, req.user.id, 'client_order_deleted', 'client_order', id, 
+      {}, req.ip);
+
+    res.json({ message: 'Commande client supprimée avec succès' });
+  } catch (error) {
+    await connection.rollback();
+    handleDatabaseError(error, res, 'Erreur lors de la suppression de la commande');
   } finally {
     connection.release();
   }
