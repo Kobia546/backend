@@ -121,7 +121,6 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
   try {
     const { limit = 10, page = 1, start_date, end_date } = req.query;
     
-    // Use subquery to avoid GROUP BY issues
     let query = `
       SELECT s.*, 
              u.full_name as seller_name,
@@ -138,6 +137,12 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
     
     const params = [req.user.company_id];
     
+    // Si ce n'est pas un admin, filtrer par vendeur
+    if (req.user.role !== 'admin') {
+      query += ' AND s.seller_id = ?';
+      params.push(req.user.id);
+    }
+    
     if (start_date) {
       query += ' AND DATE(s.created_at) >= ?';
       params.push(start_date);
@@ -153,7 +158,7 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
 
     const [sales] = await pool.execute(query, params);
     
-    // Get sale items for each sale
+    // Récupérer les items pour chaque vente
     for (let sale of sales) {
       const [items] = await pool.execute(
         'SELECT * FROM sale_items WHERE sale_id = ?',
@@ -167,6 +172,7 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
     handleDatabaseError(error, res, 'Erreur lors de la récupération des ventes');
   }
 });
+
 
 // 2. Improved error handling for logActivity function (replace around line 120)
 const logActivity = async (companyId, userId, action, entityType = null, entityId = null, details = {}, ipAddress = null) => {
@@ -318,6 +324,87 @@ app.post('/api/users/sellers', authenticateToken, requireAdmin, async (req, res)
   }
 });
 
+app.put('/api/bank-deposits/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { amount, bank_name, account_number, deposit_date, reference, notes } = req.body;
+
+    await pool.execute(
+      `UPDATE bank_deposits 
+       SET amount = ?, bank_name = ?, account_number = ?, deposit_date = ?, 
+           reference = ?, notes = ?, updated_at = NOW()
+       WHERE id = ? AND company_id = ?`,
+      [amount, bank_name, account_number, deposit_date, reference, notes, id, req.user.company_id]
+    );
+
+    await logActivity(req.user.company_id, req.user.id, 'bank_deposit_updated', 'bank_deposit', id, 
+      { bank_name, amount }, req.ip);
+
+    res.json({ message: 'Versement banque modifié avec succès' });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la modification du versement banque');
+  }
+});
+
+app.get('/api/bank-deposits', authenticateToken, async (req, res) => {
+  try {
+    const [deposits] = await pool.execute(
+      `SELECT bd.*, u.full_name as created_by_name
+       FROM bank_deposits bd
+       LEFT JOIN users u ON bd.created_by = u.id
+       WHERE bd.company_id = ? 
+       ORDER BY bd.deposit_date DESC, bd.created_at DESC`,
+      [req.user.company_id]
+    );
+    res.json(deposits);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des versements banque');
+  }
+});
+
+// Créer un versement banque
+app.post('/api/bank-deposits', authenticateToken, async (req, res) => {
+  try {
+    const { amount, bank_name, account_number, deposit_date, reference, notes } = req.body;
+    
+    if (!amount || !bank_name || !deposit_date) {
+      return res.status(400).json({ error: 'Montant, banque et date requis' });
+    }
+
+    const [result] = await pool.execute(
+      `INSERT INTO bank_deposits (company_id, amount, bank_name, account_number, deposit_date, reference, notes, created_by) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [req.user.company_id, amount, bank_name, account_number, deposit_date, reference, notes, req.user.id]
+    );
+
+    await logActivity(req.user.company_id, req.user.id, 'bank_deposit_created', 'bank_deposit', result.insertId, 
+      { bank_name, amount }, req.ip);
+
+    res.json({ message: 'Versement banque créé avec succès', depositId: result.insertId });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la création du versement banque');
+  }
+});
+
+// Supprimer un versement banque
+app.delete('/api/bank-deposits/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await pool.execute(
+      'DELETE FROM bank_deposits WHERE id = ? AND company_id = ?',
+      [id, req.user.company_id]
+    );
+
+    await logActivity(req.user.company_id, req.user.id, 'bank_deposit_deleted', 'bank_deposit', id, 
+      {}, req.ip);
+
+    res.json({ message: 'Versement banque supprimé avec succès' });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la suppression du versement banque');
+  }
+});
+
 app.get('/api/users/sellers', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const [sellers] = await pool.execute(
@@ -445,41 +532,40 @@ app.get('/api/clients', authenticateToken, async (req, res) => {
 // Créer un client
 app.post('/api/clients', authenticateToken, async (req, res) => {
   try {
-    const { name, phone, address } = req.body;
+    const { name, phone, address, business_type } = req.body;
     
     if (!name || !phone) {
       return res.status(400).json({ error: 'Nom et téléphone requis' });
     }
 
     const [result] = await pool.execute(
-      `INSERT INTO clients (company_id, name, phone, address, created_by) 
-       VALUES (?, ?, ?, ?, ?)`,
-      [req.user.company_id, name, phone, address, req.user.id]
+      `INSERT INTO clients (company_id, name, phone, address, business_type, created_by) 
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [req.user.company_id, name, phone, address, business_type || 'particulier', req.user.id]
     );
 
     await logActivity(req.user.company_id, req.user.id, 'client_created', 'client', result.insertId, 
-      { name, phone }, req.ip);
+      { name, phone, business_type }, req.ip);
 
     res.json({ message: 'Client créé avec succès', clientId: result.insertId });
   } catch (error) {
     handleDatabaseError(error, res, 'Erreur lors de la création du client');
   }
 });
-
 // Modifier un client
 app.put('/api/clients/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, phone, address } = req.body;
+    const { name, phone, address, business_type } = req.body;
 
     await pool.execute(
-      `UPDATE clients SET name = ?, phone = ?, address = ?, updated_at = NOW()
+      `UPDATE clients SET name = ?, phone = ?, address = ?, business_type = ?, updated_at = NOW()
        WHERE id = ? AND company_id = ?`,
-      [name, phone, address, id, req.user.company_id]
+      [name, phone, address, business_type || 'particulier', id, req.user.company_id]
     );
 
     await logActivity(req.user.company_id, req.user.id, 'client_updated', 'client', id, 
-      { name, phone }, req.ip);
+      { name, phone, business_type }, req.ip);
 
     res.json({ message: 'Client modifié avec succès' });
   } catch (error) {
@@ -620,33 +706,81 @@ app.post('/api/client-orders', authenticateToken, async (req, res) => {
 
 // Modifier le statut d'une commande client
 app.put('/api/client-orders/:id', authenticateToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  
   try {
     const { id } = req.params;
-    const { status, payment_amount } = req.body;
+    const { status, payment_amount, remaining_amount, payment_method } = req.body;
 
-    let updateQuery = 'UPDATE client_orders SET status = ?, updated_at = NOW()';
-    let params = [status];
+    await connection.beginTransaction();
 
-    // Si paiement complémentaire
-    if (payment_amount && status === 'completed') {
-      updateQuery += ', advance_payment = advance_payment + ?, remaining_amount = remaining_amount - ?';
-      params.push(payment_amount, payment_amount);
+    // Récupérer les données actuelles de la commande
+    const [currentOrder] = await connection.execute(
+      'SELECT * FROM client_orders WHERE id = ? AND company_id = ?',
+      [id, req.user.company_id]
+    );
+
+    if (currentOrder.length === 0) {
+      throw new Error('Commande non trouvée');
     }
 
-    updateQuery += ' WHERE id = ? AND company_id = ?';
-    params.push(id, req.user.company_id);
+    const order = currentOrder[0];
+    let updateData = { status };
 
-    await pool.execute(updateQuery, params);
+    // Si c'est un paiement partiel
+    if (payment_amount && parseFloat(payment_amount) > 0) {
+      const newAdvancePayment = parseFloat(order.advance_payment || 0) + parseFloat(payment_amount);
+      const newRemainingAmount = parseFloat(order.total_amount) - newAdvancePayment;
+      
+      updateData = {
+        status: newRemainingAmount <= 0 ? 'completed' : 'partial_payment',
+        advance_payment: newAdvancePayment,
+        remaining_amount: Math.max(0, newRemainingAmount)
+      };
 
-    await logActivity(req.user.company_id, req.user.id, 'client_order_status_updated', 'client_order', id, 
-      { status, payment_amount }, req.ip);
+      // Enregistrer le paiement dans un historique si nécessaire
+      await connection.execute(
+        `INSERT INTO client_order_payments (order_id, payment_amount, payment_method, payment_date, created_by) 
+         VALUES (?, ?, ?, NOW(), ?)`,
+        [id, payment_amount, payment_method || 'cash', req.user.id]
+      );
+    } 
+    // Si c'est juste une mise à jour de statut
+    else if (remaining_amount !== undefined) {
+      updateData.remaining_amount = remaining_amount;
+    }
 
-    res.json({ message: 'Statut de la commande modifié avec succès' });
+    // Construire la requête de mise à jour dynamiquement
+    const updateFields = Object.keys(updateData).map(key => `${key} = ?`).join(', ');
+    const updateValues = Object.values(updateData);
+    
+    await connection.execute(
+      `UPDATE client_orders SET ${updateFields}, updated_at = NOW() WHERE id = ? AND company_id = ?`,
+      [...updateValues, id, req.user.company_id]
+    );
+
+    await connection.commit();
+
+    await logActivity(req.user.company_id, req.user.id, 'client_order_updated', 'client_order', id, 
+      { status, payment_amount, new_remaining: updateData.remaining_amount }, req.ip);
+
+    res.json({ 
+      message: 'Commande mise à jour avec succès',
+      ...updateData
+    });
+
   } catch (error) {
-    handleDatabaseError(error, res, 'Erreur lors de la modification du statut');
+    await connection.rollback();
+    
+    if (error.message === 'Commande non trouvée') {
+      return res.status(404).json({ error: error.message });
+    }
+    
+    handleDatabaseError(error, res, 'Erreur lors de la mise à jour de la commande');
+  } finally {
+    connection.release();
   }
 });
-
 // Supprimer une commande client
 app.delete('/api/client-orders/:id', authenticateToken, async (req, res) => {
   const connection = await pool.getConnection();
@@ -681,13 +815,31 @@ app.delete('/api/client-orders/:id', authenticateToken, async (req, res) => {
     connection.release();
   }
 });
+app.get('/api/client-orders/:id/payments', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
 
+    const [payments] = await pool.execute(
+      `SELECT cop.*, u.full_name as created_by_name
+       FROM client_order_payments cop
+       LEFT JOIN users u ON cop.created_by = u.id
+       WHERE cop.order_id = ?
+       ORDER BY cop.payment_date DESC`,
+      [id]
+    );
+
+    res.json(payments);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération de l\'historique des paiements');
+  }
+});
 app.get('/api/products', authenticateToken, async (req, res) => {
   try {
     const { search, category, low_stock, page = 1, limit = 50 } = req.query;
     
     let query = `
-      SELECT p.*, s.name as supplier_name
+      SELECT p.*, s.name as supplier_name,
+             DATE(p.created_at) as creation_date
       FROM products p
       LEFT JOIN suppliers s ON p.supplier_id = s.id
       WHERE p.company_id = ?
@@ -699,13 +851,13 @@ app.get('/api/products', authenticateToken, async (req, res) => {
       params.push(`%${search}%`, `%${search}%`, `%${search}%`);
     }
 
-    if (category) {
+    if (category && category !== '') {
       query += ' AND p.category = ?';
       params.push(category);
     }
 
     if (low_stock === 'true') {
-      query += ' AND p.current_stock <= p.min_stock_alert';
+      query += ' AND p.current_stock <= 5';
     }
 
     query += ' ORDER BY p.created_at DESC LIMIT ? OFFSET ?';
@@ -718,6 +870,24 @@ app.get('/api/products', authenticateToken, async (req, res) => {
     handleDatabaseError(error, res, 'Erreur lors de la récupération des produits');
   }
 });
+
+app.get('/api/products/categories', authenticateToken, async (req, res) => {
+  try {
+    const [categories] = await pool.execute(
+      `SELECT DISTINCT category 
+       FROM products 
+       WHERE company_id = ? AND category IS NOT NULL AND category != ''
+       ORDER BY category`,
+      [req.user.company_id]
+    );
+
+    const categoryList = categories.map(row => row.category);
+    res.json(categoryList);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des catégories');
+  }
+});
+
 
 // Route de vente
 app.post('/api/sales', authenticateToken, async (req, res) => {
@@ -763,23 +933,24 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
     const totalAmount = subtotal - discount;
 
     // Créer la vente
-    const [saleResult] = await connection.execute(
+  const [saleResult] = await connection.execute(
       `INSERT INTO sales (company_id, sale_number, customer_name, customer_phone,
        subtotal, discount, total_amount, total_profit, payment_method, seller_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         req.user.company_id,
         saleNumber,
-        customer_name,
-        customer_phone,
+        customer_name || null,
+        customer_phone || null,
         subtotal,
         discount,
         totalAmount,
         totalProfit,
-        payment_method,
+        payment_method || 'cash',
         req.user.id
       ]
     );
+
 
     const saleId = saleResult.insertId;
 
@@ -870,6 +1041,55 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
 
   } finally {
     connection.release();
+  }
+});
+// Route pour ajouter un paiement partiel
+app.post('/api/client-orders/:id/payments', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { payment_amount, payment_method } = req.body;
+
+    if (!payment_amount || payment_amount <= 0) {
+      return res.status(400).json({ error: 'Montant de paiement invalide' });
+    }
+
+    // Récupérer les infos de la commande
+    const [orders] = await pool.execute(
+      'SELECT * FROM client_orders WHERE id = ? AND company_id = ?',
+      [id, req.user.company_id]
+    );
+
+    if (orders.length === 0) {
+      return res.status(404).json({ error: 'Commande non trouvée' });
+    }
+
+    const order = orders[0];
+    const newAdvancePayment = parseFloat(order.advance_payment) + parseFloat(payment_amount);
+    const newRemainingAmount = parseFloat(order.total_amount) - newAdvancePayment;
+
+    // Déterminer le nouveau statut
+    const newStatus = newRemainingAmount <= 0 ? 'completed' : 'partial_payment';
+
+    // Mettre à jour la commande
+    await pool.execute(
+      `UPDATE client_orders 
+       SET advance_payment = ?, remaining_amount = ?, status = ?, updated_at = NOW()
+       WHERE id = ? AND company_id = ?`,
+      [newAdvancePayment, Math.max(0, newRemainingAmount), newStatus, id, req.user.company_id]
+    );
+
+    await logActivity(req.user.company_id, req.user.id, 'client_order_payment_added', 'client_order', id, 
+      { payment_amount, payment_method, new_status: newStatus }, req.ip);
+
+    res.json({ 
+      message: 'Paiement ajouté avec succès',
+      new_advance_payment: newAdvancePayment,
+      new_remaining_amount: Math.max(0, newRemainingAmount),
+      status: newStatus
+    });
+
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de l\'ajout du paiement');
   }
 });
 
@@ -1401,31 +1621,69 @@ app.get('/api/reports/company-stats', authenticateToken, async (req, res) => {
   try {
     const { period = '30' } = req.query;
 
-    const [stats] = await pool.execute(`
-      SELECT 
-        (SELECT COUNT(*) FROM products WHERE company_id = ?) as total_products,
-        (SELECT COUNT(*) FROM users WHERE company_id = ? AND role = 'seller' AND is_active = 1) as active_sellers,
-        (SELECT COUNT(*) FROM sales WHERE company_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_sales,
-        (SELECT COALESCE(SUM(total_amount), 0) FROM sales WHERE company_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_revenue,
-        (SELECT COALESCE(SUM(total_profit), 0) FROM sales WHERE company_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_profit,
-        (SELECT COUNT(*) FROM products WHERE company_id = ? AND current_stock <= min_stock_alert) as low_stock_products,
-        (SELECT COUNT(*) FROM suppliers WHERE company_id = ?) as total_suppliers,
-        (SELECT COUNT(*) FROM supplier_orders WHERE company_id = ? AND status = 'pending') as pending_supplier_orders,
-        (SELECT COALESCE(SUM(amount), 0) FROM supplier_orders WHERE company_id = ? AND status = 'pending') as pending_supplier_amount,
-        (SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE company_id = ? AND expense_date >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_expenses
-    `, [
-      req.user.company_id, req.user.company_id, req.user.company_id, period,
-      req.user.company_id, period, req.user.company_id, period, req.user.company_id,
-      req.user.company_id, req.user.company_id, req.user.company_id, req.user.company_id, period
-    ]);
+    if (req.user.role === 'admin') {
+      // Statistiques complètes pour admin
+      const [stats] = await pool.execute(`
+        SELECT 
+          (SELECT COUNT(*) FROM products WHERE company_id = ?) as total_products,
+          (SELECT COUNT(*) FROM users WHERE company_id = ? AND role = 'seller' AND is_active = 1) as active_sellers,
+          (SELECT COUNT(*) FROM sales WHERE company_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_sales,
+          (SELECT COALESCE(SUM(total_amount), 0) FROM sales WHERE company_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_revenue,
+          (SELECT COALESCE(SUM(total_profit), 0) FROM sales WHERE company_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_profit,
+          (SELECT COUNT(*) FROM products WHERE company_id = ? AND current_stock <= 5) as low_stock_products,
+          (SELECT COUNT(*) FROM suppliers WHERE company_id = ?) as total_suppliers,
+          (SELECT COUNT(*) FROM supplier_orders WHERE company_id = ? AND status = 'pending') as pending_supplier_orders,
+          (SELECT COALESCE(SUM(amount), 0) FROM supplier_orders WHERE company_id = ? AND status = 'pending') as pending_supplier_amount,
+          (SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE company_id = ? AND expense_date >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_expenses
+      `, [
+        req.user.company_id, req.user.company_id, req.user.company_id, period,
+        req.user.company_id, period, req.user.company_id, period, req.user.company_id,
+        req.user.company_id, req.user.company_id, req.user.company_id, req.user.company_id, period
+      ]);
 
-    res.json(stats[0]);
+      res.json(stats[0]);
+    } else {
+      // Statistiques limitées pour vendeurs
+      const [stats] = await pool.execute(`
+        SELECT 
+          (SELECT COUNT(*) FROM products WHERE company_id = ?) as total_products,
+          (SELECT COUNT(*) FROM sales WHERE company_id = ? AND seller_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_sales,
+          (SELECT COALESCE(SUM(total_amount), 0) FROM sales WHERE company_id = ? AND seller_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_revenue,
+          (SELECT COALESCE(SUM(total_profit), 0) FROM sales WHERE company_id = ? AND seller_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) as recent_profit,
+          (SELECT COUNT(*) FROM products WHERE company_id = ? AND current_stock <= 5) as low_stock_products
+      `, [
+        req.user.company_id, 
+        req.user.company_id, req.user.id, period,
+        req.user.company_id, req.user.id, period,
+        req.user.company_id, req.user.id, period,
+        req.user.company_id
+      ]);
+
+      res.json({
+        ...stats[0],
+        active_sellers: 1, // Le vendeur lui-même
+        total_suppliers: 0, // Pas d'accès aux fournisseurs pour vendeurs
+        pending_supplier_orders: 0,
+        pending_supplier_amount: 0,
+        recent_expenses: 0
+      });
+    }
 
   } catch (error) {
     handleDatabaseError(error, res, 'Erreur lors de la récupération des statistiques');
   }
 });
-
+app.get('/api/debug/user-info', authenticateToken, async (req, res) => {
+  res.json({
+    user: {
+      id: req.user.id,
+      username: req.user.username,
+      role: req.user.role,
+      company_id: req.user.company_id
+    },
+    timestamp: new Date().toISOString()
+  });
+});
 // Middleware de gestion d'erreurs global
 app.use((error, req, res, next) => {
   console.error('Erreur non gérée:', error);
