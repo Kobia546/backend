@@ -743,6 +743,14 @@ app.put('/api/client-orders/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { status, remaining_amount, payment_amount, payment_method } = req.body;
 
+    // Validation des status autorisés selon le schéma de base
+    const validStatuses = ['pending', 'completed', 'cancelled'];
+    if (status && !validStatuses.includes(status)) {
+      return res.status(400).json({ 
+        error: `Status invalide. Status autorisés: ${validStatuses.join(', ')}` 
+      });
+    }
+
     console.log('Updating order:', { id, status, remaining_amount, payment_amount });
 
     await connection.beginTransaction();
@@ -797,8 +805,8 @@ app.put('/api/client-orders/:id', authenticateToken, async (req, res) => {
       updateFields.push('remaining_amount = ?');
       updateValues.push(newRemainingAmount);
       
-      // Mettre à jour le statut automatiquement
-      const newStatus = newRemainingAmount <= 0 ? 'completed' : 'partial_payment';
+      // Mettre à jour le statut automatiquement avec les status corrects
+      const newStatus = newRemainingAmount <= 0 ? 'completed' : 'pending';
       if (!updateFields.some(field => field.startsWith('status'))) {
         updateFields.push('status = ?');
         updateValues.push(newStatus);
