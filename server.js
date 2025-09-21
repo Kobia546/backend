@@ -123,6 +123,13 @@ const authenticateToken = async (req, res, next) => {
   }
 };
 
+// Middleware admin
+const requireAdmin = (req, res, next) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Accès admin requis' });
+  }
+  next();
+};
 // Fonction de logging d'activité avec gestion d'erreurs
 
 // Update your server.js with these corrected routes:
