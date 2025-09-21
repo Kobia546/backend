@@ -80,13 +80,26 @@ const authenticateToken = async (req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     
-    const [users] = await pool.execute(
-      `SELECT u.*, c.name as company_name, c.is_active as company_active 
-       FROM users u 
-       JOIN companies c ON u.company_id = c.id 
-       WHERE u.id = ? AND u.is_active = 1 AND c.is_active = 1`,
-      [decoded.userId]
-    );
+    // Ajouter un retry pour les connexions DB
+    let retries = 3;
+    let users = null;
+    
+    while (retries > 0) {
+      try {
+        [users] = await pool.execute(
+          `SELECT u.*, c.name as company_name, c.is_active as company_active 
+           FROM users u 
+           JOIN companies c ON u.company_id = c.id 
+           WHERE u.id = ? AND u.is_active = 1 AND c.is_active = 1`,
+          [decoded.userId]
+        );
+        break;
+      } catch (dbError) {
+        retries--;
+        if (retries === 0) throw dbError;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
 
     if (users.length === 0) {
       return res.status(403).json({ error: 'Utilisateur ou entreprise inactive' });
@@ -97,19 +110,17 @@ const authenticateToken = async (req, res, next) => {
     next();
   } catch (error) {
     console.error('Erreur authentification:', error);
-    if (error.code === 'ECONNRESET' || error.code === 'ER_SERVER_SHUTDOWN') {
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(403).json({ error: 'Token invalide' });
+    }
+    if (error.name === 'TokenExpiredError') {
+      return res.status(403).json({ error: 'Token expiré' });
+    }
+    if (error.code === 'ECONNRESET' || error.code === 'ER_SERVER_SHUTDOWN' || error.code === 'PROTOCOL_CONNECTION_LOST') {
       return res.status(503).json({ error: 'Service temporairement indisponible' });
     }
-    return res.status(403).json({ error: 'Token invalide' });
+    return res.status(500).json({ error: 'Erreur serveur' });
   }
-};
-
-// Middleware admin
-const requireAdmin = (req, res, next) => {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Accès admin requis' });
-  }
-  next();
 };
 
 // Fonction de logging d'activité avec gestion d'erreurs
@@ -203,16 +214,29 @@ const logActivity = async (companyId, userId, action, entityType = null, entityI
 const handleDatabaseError = (error, res, customMessage = 'Erreur serveur') => {
   console.error('Erreur base de données:', error);
   
-  if (error.code === 'ECONNRESET' || error.code === 'ER_SERVER_SHUTDOWN') {
+  // Erreurs de connexion
+  if (error.code === 'ECONNRESET' || error.code === 'ER_SERVER_SHUTDOWN' || error.code === 'PROTOCOL_CONNECTION_LOST') {
     return res.status(503).json({ error: 'Service de base de données temporairement indisponible. Veuillez réessayer.' });
   }
   
+  // Erreurs de timeout
+  if (error.code === 'ETIMEDOUT' || error.code === 'ER_LOCK_WAIT_TIMEOUT') {
+    return res.status(503).json({ error: 'Timeout de la base de données. Veuillez réessayer.' });
+  }
+  
+  // Erreurs de configuration
   if (error.code === 'ER_NO_DEFAULT_FOR_FIELD') {
     return res.status(500).json({ error: 'Erreur de configuration de base de données. Veuillez contacter l\'administrateur.' });
   }
   
+  // Erreurs de contraintes
   if (error.code === 'ER_DUP_ENTRY') {
     return res.status(400).json({ error: 'Cette entrée existe déjà dans la base de données.' });
+  }
+  
+  // Erreurs de valeurs nulles
+  if (error.code === 'ER_BAD_NULL_ERROR') {
+    return res.status(400).json({ error: 'Valeur requise manquante.' });
   }
   
   return res.status(500).json({ error: customMessage });
@@ -710,7 +734,9 @@ app.put('/api/client-orders/:id', authenticateToken, async (req, res) => {
   
   try {
     const { id } = req.params;
-    const { status, payment_amount, remaining_amount, payment_method } = req.body;
+    const { status, remaining_amount, payment_amount, payment_method } = req.body;
+
+    console.log('Updating order:', { id, status, remaining_amount, payment_amount });
 
     await connection.beginTransaction();
 
@@ -721,60 +747,92 @@ app.put('/api/client-orders/:id', authenticateToken, async (req, res) => {
     );
 
     if (currentOrder.length === 0) {
-      throw new Error('Commande non trouvée');
+      await connection.rollback();
+      return res.status(404).json({ error: 'Commande non trouvée' });
     }
 
     const order = currentOrder[0];
-    let updateData = { status };
-
-    // Si c'est un paiement partiel
-    if (payment_amount && parseFloat(payment_amount) > 0) {
-      const newAdvancePayment = parseFloat(order.advance_payment || 0) + parseFloat(payment_amount);
-      const newRemainingAmount = parseFloat(order.total_amount) - newAdvancePayment;
+    
+    // Préparer les données de mise à jour
+    let updateFields = [];
+    let updateValues = [];
+    
+    // Toujours mettre à jour le statut si fourni
+    if (status) {
+      updateFields.push('status = ?');
+      updateValues.push(status);
+    }
+    
+    // Si remaining_amount est fourni, l'utiliser directement
+    if (remaining_amount !== undefined && remaining_amount !== null) {
+      updateFields.push('remaining_amount = ?');
+      updateValues.push(Math.max(0, parseFloat(remaining_amount)));
       
-      updateData = {
-        status: newRemainingAmount <= 0 ? 'completed' : 'partial_payment',
-        advance_payment: newAdvancePayment,
-        remaining_amount: Math.max(0, newRemainingAmount)
-      };
-
-      // Enregistrer le paiement dans un historique si nécessaire
+      // Calculer l'avance en fonction du nouveau montant restant
+      const totalAmount = parseFloat(order.total_amount);
+      const newRemainingAmount = Math.max(0, parseFloat(remaining_amount));
+      const newAdvancePayment = totalAmount - newRemainingAmount;
+      
+      updateFields.push('advance_payment = ?');
+      updateValues.push(Math.max(0, newAdvancePayment));
+    }
+    
+    // Si payment_amount est fourni (paiement partiel)
+    if (payment_amount && parseFloat(payment_amount) > 0) {
+      const currentAdvance = parseFloat(order.advance_payment || 0);
+      const newAdvancePayment = currentAdvance + parseFloat(payment_amount);
+      const totalAmount = parseFloat(order.total_amount);
+      const newRemainingAmount = Math.max(0, totalAmount - newAdvancePayment);
+      
+      updateFields.push('advance_payment = ?');
+      updateValues.push(newAdvancePayment);
+      
+      updateFields.push('remaining_amount = ?');
+      updateValues.push(newRemainingAmount);
+      
+      // Mettre à jour le statut automatiquement
+      const newStatus = newRemainingAmount <= 0 ? 'completed' : 'partial_payment';
+      if (!updateFields.some(field => field.startsWith('status'))) {
+        updateFields.push('status = ?');
+        updateValues.push(newStatus);
+      }
+      
+      // Enregistrer le paiement dans l'historique
       await connection.execute(
         `INSERT INTO client_order_payments (order_id, payment_amount, payment_method, payment_date, created_by) 
          VALUES (?, ?, ?, NOW(), ?)`,
         [id, payment_amount, payment_method || 'cash', req.user.id]
       );
-    } 
-    // Si c'est juste une mise à jour de statut
-    else if (remaining_amount !== undefined) {
-      updateData.remaining_amount = remaining_amount;
     }
-
-    // Construire la requête de mise à jour dynamiquement
-    const updateFields = Object.keys(updateData).map(key => `${key} = ?`).join(', ');
-    const updateValues = Object.values(updateData);
     
-    await connection.execute(
-      `UPDATE client_orders SET ${updateFields}, updated_at = NOW() WHERE id = ? AND company_id = ?`,
-      [...updateValues, id, req.user.company_id]
-    );
+    // Ajouter la mise à jour de updated_at
+    updateFields.push('updated_at = NOW()');
+    
+    // Construire et exécuter la requête de mise à jour
+    if (updateFields.length > 1) { // Plus que juste updated_at
+      const query = `UPDATE client_orders SET ${updateFields.join(', ')} WHERE id = ? AND company_id = ?`;
+      updateValues.push(id, req.user.company_id);
+      
+      console.log('Update query:', query);
+      console.log('Update values:', updateValues);
+      
+      await connection.execute(query, updateValues);
+    }
 
     await connection.commit();
 
     await logActivity(req.user.company_id, req.user.id, 'client_order_updated', 'client_order', id, 
-      { status, payment_amount, new_remaining: updateData.remaining_amount }, req.ip);
+      { status, payment_amount, remaining_amount }, req.ip);
 
     res.json({ 
       message: 'Commande mise à jour avec succès',
-      ...updateData
+      status: status,
+      remaining_amount: remaining_amount
     });
 
   } catch (error) {
     await connection.rollback();
-    
-    if (error.message === 'Commande non trouvée') {
-      return res.status(404).json({ error: error.message });
-    }
+    console.error('Error updating client order:', error);
     
     handleDatabaseError(error, res, 'Erreur lors de la mise à jour de la commande');
   } finally {
