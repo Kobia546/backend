@@ -1428,18 +1428,80 @@ app.delete('/api/expenses/:id', authenticateToken, async (req, res) => {
 // ===============================================
 
 // Modifier un produit
+// Fixed PUT /api/products/:id route
 app.put('/api/products/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, description, barcode, category, supplier_id, purchase_price, selling_price, current_stock } = req.body;
+    const { 
+      name, 
+      description, 
+      barcode, 
+      category, 
+      supplier_id, 
+      purchase_price, 
+      selling_price, 
+      current_stock 
+    } = req.body;
 
+    // Validate required fields
     if (!name || !purchase_price || !selling_price) {
-      return res.status(400).json({ error: 'Champs obligatoires manquants' });
+      return res.status(400).json({ 
+        error: 'Champs obligatoires manquants',
+        details: 'Nom, prix d\'achat et prix de vente sont requis'
+      });
     }
 
-    // Vérifier que le produit appartient à l'entreprise
+    // Validate numeric values
+    const parsedPurchasePrice = parseFloat(purchase_price);
+    const parsedSellingPrice = parseFloat(selling_price);
+    const parsedCurrentStock = parseInt(current_stock) || 0;
+
+    if (isNaN(parsedPurchasePrice) || parsedPurchasePrice < 0) {
+      return res.status(400).json({ 
+        error: 'Prix d\'achat invalide',
+        details: 'Le prix d\'achat doit être un nombre positif'
+      });
+    }
+
+    if (isNaN(parsedSellingPrice) || parsedSellingPrice < 0) {
+      return res.status(400).json({ 
+        error: 'Prix de vente invalide',
+        details: 'Le prix de vente doit être un nombre positif'
+      });
+    }
+
+    if (parsedCurrentStock < 0) {
+      return res.status(400).json({ 
+        error: 'Stock invalide',
+        details: 'Le stock doit être un nombre positif'
+      });
+    }
+
+    // Validate supplier_id if provided
+    if (supplier_id && supplier_id !== '') {
+      const parsedSupplierId = parseInt(supplier_id);
+      if (isNaN(parsedSupplierId)) {
+        return res.status(400).json({ 
+          error: 'ID fournisseur invalide'
+        });
+      }
+
+      // Check if supplier exists and belongs to the same company
+      const [supplierCheck] = await pool.execute(
+        'SELECT id FROM suppliers WHERE id = ? AND company_id = ?',
+        [parsedSupplierId, req.user.company_id]
+      );
+
+      if (supplierCheck.length === 0) {
+        return res.status(400).json({ 
+          error: 'Fournisseur non trouvé ou n\'appartient pas à votre entreprise'
+        });
+      }
+    }
+
+    // Check if product exists and belongs to the company
     const [existing] = await pool.execute(
-      'SELECT id FROM products WHERE id = ? AND company_id = ?',
+      'SELECT id, name FROM products WHERE id = ? AND company_id = ?',
       [id, req.user.company_id]
     );
 
@@ -1447,22 +1509,93 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Produit non trouvé' });
     }
 
+    // Check if barcode is unique (if provided and different from current)
+    if (barcode && barcode.trim() !== '') {
+      const [barcodeCheck] = await pool.execute(
+        'SELECT id FROM products WHERE barcode = ? AND company_id = ? AND id != ?',
+        [barcode.trim(), req.user.company_id, id]
+      );
+
+      if (barcodeCheck.length > 0) {
+        return res.status(400).json({ 
+          error: 'Code-barres déjà utilisé par un autre produit'
+        });
+      }
+    }
+
+    // Prepare values for update
+    const finalSupplierId = supplier_id && supplier_id !== '' ? parseInt(supplier_id) : null;
+    const finalBarcode = barcode && barcode.trim() !== '' ? barcode.trim() : null;
+    const finalCategory = category && category.trim() !== '' ? category.trim() : null;
+    const finalDescription = description && description.trim() !== '' ? description.trim() : null;
+
+    // Update the product
     await pool.execute(
-      `UPDATE products SET name = ?, description = ?, barcode = ?, category = ?, 
-       supplier_id = ?, purchase_price = ?, selling_price = ?, current_stock = ?, updated_at = NOW()
+      `UPDATE products SET 
+        name = ?, 
+        description = ?, 
+        barcode = ?, 
+        category = ?,
+        supplier_id = ?, 
+        purchase_price = ?, 
+        selling_price = ?, 
+        current_stock = ?, 
+        updated_at = NOW()
        WHERE id = ? AND company_id = ?`,
-      [name, description, barcode, category, supplier_id, purchase_price, selling_price, current_stock, id, req.user.company_id]
+      [
+        name.trim(), 
+        finalDescription, 
+        finalBarcode, 
+        finalCategory,
+        finalSupplierId, 
+        parsedPurchasePrice, 
+        parsedSellingPrice, 
+        parsedCurrentStock, 
+        id, 
+        req.user.company_id
+      ]
     );
 
-    await logActivity(req.user.company_id, req.user.id, 'product_updated', 'product', id, 
-      { name }, req.ip);
+    // Log the activity
+    await logActivity(
+      req.user.company_id, 
+      req.user.id, 
+      'product_updated', 
+      'product', 
+      id,
+      { 
+        name: name.trim(), 
+        old_name: existing[0].name 
+      }, 
+      req.ip
+    );
 
-    res.json({ message: 'Produit modifié avec succès' });
+    res.json({ 
+      message: 'Produit modifié avec succès',
+      product_id: id
+    });
+
   } catch (error) {
+    console.error('Error updating product:', error);
+    
+    // Handle specific database errors
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({ 
+        error: 'Conflit de données',
+        details: 'Un produit avec ces informations existe déjà'
+      });
+    }
+
+    if (error.code === 'ER_NO_REFERENCED_ROW_2') {
+      return res.status(400).json({ 
+        error: 'Référence invalide',
+        details: 'Le fournisseur spécifié n\'existe pas'
+      });
+    }
+
     handleDatabaseError(error, res, 'Erreur lors de la modification du produit');
   }
 });
-
 // Supprimer un produit
 app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   try {
