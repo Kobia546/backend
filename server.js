@@ -979,29 +979,38 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
     let totalProfit = 0;
     const saleNumber = `SALE-${Date.now()}-${req.user.id}`;
 
+    const saleItems = [];
+
     // Vérifier stock et calculer totaux
-    for (const item of items) {
-      const [products] = await connection.execute(
-        'SELECT current_stock, purchase_price, selling_price FROM products WHERE id = ? AND company_id = ?',
-        [item.product_id, req.user.company_id]
-      );
+  for (const item of items) {
+  const [products] = await connection.execute(
+    'SELECT current_stock, purchase_price, selling_price, name FROM products WHERE id = ? AND company_id = ?', // ← Ajouter 'name'
+    [item.product_id, req.user.company_id]
+  );
 
-      if (products.length === 0) {
-        throw new Error(`Produit ${item.product_id} non trouvé`);
-      }
+  if (products.length === 0) {
+    throw new Error(`Produit ${item.product_id} non trouvé`);
+  }
 
-      const product = products[0];
+  const product = products[0];
+  
+  // Maintenant product.name existe
+  saleItems.push({
+    name: product.name,
+    quantity: item.quantity,
+    unit_price: product.selling_price
+  });
 
-      if (product.current_stock < item.quantity) {
-        throw new Error(`Stock insuffisant pour le produit ${item.product_id} (stock actuel: ${product.current_stock}, demandé: ${item.quantity})`);
-      }
+  if (product.current_stock < item.quantity) {
+    throw new Error(`Stock insuffisant pour le produit ${item.product_id} (stock actuel: ${product.current_stock}, demandé: ${item.quantity})`);
+  }
 
-      const lineTotal = product.selling_price * item.quantity;
-      const lineProfit = (product.selling_price - product.purchase_price) * item.quantity;
+  const lineTotal = product.selling_price * item.quantity;
+  const lineProfit = (product.selling_price - product.purchase_price) * item.quantity;
 
-      subtotal += lineTotal;
-      totalProfit += lineProfit;
-    }
+  subtotal += lineTotal;
+  totalProfit += lineProfit;
+}
 
     const totalAmount = subtotal - discount;
 
@@ -1082,15 +1091,22 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
     await connection.commit();
 
     // Log de l'activité
-    await logActivity(
-      req.user.company_id,
-      req.user.id,
-      'sale_completed',
-      'sale',
-      saleId,
-      { saleNumber, totalAmount, itemCount: items.length },
-      req.ip
-    );
+   await logActivity(
+  req.user.company_id,
+  req.user.id,
+  'sale_completed',
+  'sale',
+  saleId,
+  { 
+    saleNumber, 
+    totalAmount, 
+    itemCount: items.length,
+    items: saleItems, // ← Ajouter cette ligne
+    customerName: customer_name || null,
+    paymentMethod: payment_method || 'cash'
+  },
+  req.ip
+);
 
     res.json({
       message: 'Vente enregistrée avec succès',
