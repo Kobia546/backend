@@ -46,14 +46,14 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME,
   port: process.env.DB_PORT || 5571,
   waitForConnections: true,
-  connectionLimit: 10,
+  connectionLimit: 3, // RÉDUIRE de 10 à 3
   queueLimit: 0,
-  acquireTimeout: 60000,
-  timeout: 60000,
+  acquireTimeout: 30000, // RÉDUIRE de 60000 à 30000
+  timeout: 30000, // RÉDUIRE de 60000 à 30000
   reconnect: true,
-  idleTimeout: 3000000000,
+  idleTimeout: 60000, // RÉDUIRE de 3000000000 à 60000
   enableKeepAlive: true,
-  keepAliveInitialDelay: 0
+  keepAliveInitialDelay: 30000 // AJOUTER 30 secondes
 });
 
 async function testConnection() {
@@ -539,6 +539,178 @@ app.post('/api/products', authenticateToken, async (req, res) => {
     }
   } finally {
     connection.release();
+  }
+});
+
+// Dans votre server.js, remplacer les routes categories par ces versions simplifiées :
+
+// Récupérer les catégories directement depuis les produits existants
+app.get('/api/categories/names', authenticateToken, async (req, res) => {
+  try {
+    const [categories] = await pool.execute(
+      `SELECT DISTINCT category as name
+       FROM products 
+       WHERE company_id = ? 
+         AND category IS NOT NULL 
+         AND category != '' 
+         AND category != 'Non catégorisé'
+       ORDER BY category ASC`,
+      [req.user.company_id]
+    );
+
+    // Ajouter la catégorie par défaut
+    const categoryNames = categories.map(row => row.name);
+    if (!categoryNames.includes('Non catégorisé')) {
+      categoryNames.unshift('Non catégorisé');
+    }
+
+    res.json(categoryNames);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des catégories');
+  }
+});
+
+// Créer une catégorie (simulation - sauvegarde juste le nom)
+app.post('/api/categories', authenticateToken, async (req, res) => {
+  try {
+    const { name } = req.body;
+    
+    if (!name || name.trim().length === 0) {
+      return res.status(400).json({ error: 'Nom de catégorie requis' });
+    }
+
+    const categoryName = name.trim();
+
+    // Vérifier si la catégorie existe déjà dans les produits
+    const [existing] = await pool.execute(
+      'SELECT id FROM products WHERE company_id = ? AND category = ? LIMIT 1',
+      [req.user.company_id, categoryName]
+    );
+
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Cette catégorie existe déjà' });
+    }
+
+    await logActivity(req.user.company_id, req.user.id, 'category_created', 'category', null, 
+      { name: categoryName }, req.ip);
+
+    // Pas besoin d'insérer dans une table categories, 
+    // la catégorie sera créée quand un produit l'utilisera
+    res.json({ 
+      message: 'Catégorie créée avec succès', 
+      name: categoryName
+    });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la création de la catégorie');
+  }
+});
+
+// Modifier la route de création de produit pour gérer les catégories automatiquement
+app.post('/api/products', authenticateToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  
+  try {
+    const { name, description, barcode, category, supplier_id, purchase_price, selling_price, initial_stock } = req.body;
+
+    if (!name || !purchase_price || !selling_price) {
+      return res.status(400).json({ error: 'Champs obligatoires manquants' });
+    }
+
+    await connection.beginTransaction();
+
+    // Vérifier unicité du code-barres dans l'entreprise si fourni
+    if (barcode) {
+      const [existing] = await connection.execute(
+        'SELECT id FROM products WHERE company_id = ? AND barcode = ?',
+        [req.user.company_id, barcode]
+      );
+      if (existing.length > 0) {
+        throw new Error('Ce code-barres existe déjà dans votre entreprise');
+      }
+    }
+
+    const purchasePrice = parseFloat(purchase_price);
+    const sellingPrice = parseFloat(selling_price);
+    const stockValue = parseInt(initial_stock) || 0;
+    const supplierIdValue = supplier_id ? parseInt(supplier_id) : null;
+    
+    // Assurer une catégorie par défaut
+    const finalCategory = category && category.trim() ? category.trim() : 'Non catégorisé';
+
+    // Insérer le produit avec la catégorie
+    const [result] = await connection.execute(
+      `INSERT INTO products (company_id, name, description, barcode, category, supplier_id, 
+       purchase_price, selling_price, current_stock, created_by) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.user.company_id, 
+        name, 
+        description || null, 
+        barcode || null, 
+        finalCategory, 
+        supplierIdValue, 
+        purchasePrice, 
+        sellingPrice, 
+        stockValue, 
+        req.user.id
+      ]
+    );
+
+    const productId = result.insertId;
+
+    // Mouvement de stock initial
+    if (stockValue > 0) {
+      await connection.execute(
+        `INSERT INTO stock_movements (company_id, product_id, movement_type, quantity, 
+         unit_cost, reference_type, user_id) 
+         VALUES (?, ?, 'in', ?, ?, 'manual', ?)`,
+        [req.user.company_id, productId, stockValue, purchasePrice, req.user.id]
+      );
+    }
+
+    await connection.commit();
+    
+    await logActivity(req.user.company_id, req.user.id, 'product_created', 'product', productId, 
+      { name, initial_stock: stockValue, category: finalCategory }, req.ip);
+
+    res.json({ message: 'Produit créé avec succès', productId });
+
+  } catch (error) {
+    await connection.rollback();
+    
+    console.error('Product creation error:', error);
+    
+    if (error.message.includes('code-barres')) {
+      res.status(400).json({ error: error.message });
+    } else if (error.code === 'ER_NO_DEFAULT_FOR_FIELD') {
+      res.status(500).json({ error: 'Erreur de configuration de base de données. Champ manquant requis.' });
+    } else if (error.code === 'ER_BAD_NULL_ERROR') {
+      res.status(400).json({ error: 'Valeur requise manquante pour un champ obligatoire.' });
+    } else {
+      handleDatabaseError(error, res, 'Erreur lors de la création du produit');
+    }
+  } finally {
+    connection.release();
+  }
+});
+
+// Récupérer les catégories existantes depuis les produits (route alternative)
+app.get('/api/products/categories', authenticateToken, async (req, res) => {
+  try {
+    const [categories] = await pool.execute(
+      `SELECT DISTINCT category 
+       FROM products 
+       WHERE company_id = ? 
+         AND category IS NOT NULL 
+         AND category != ''
+       ORDER BY category`,
+      [req.user.company_id]
+    );
+
+    const categoryList = categories.map(row => row.category);
+    res.json(categoryList);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des catégories');
   }
 });
 // ===============================================
@@ -1276,83 +1448,21 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
 // ===============================================
 
 // Récupérer toutes les commandes fournisseurs
-app.get('/api/supplier-orders', authenticateToken, async (req, res) => {
+
+app.get('/api/products/categories', authenticateToken, async (req, res) => {
   try {
-    const [orders] = await pool.execute(
-      `SELECT so.*, s.name as supplier_name 
-       FROM supplier_orders so
-       JOIN suppliers s ON so.supplier_id = s.id
-       WHERE so.company_id = ? 
-       ORDER BY so.due_date ASC, so.created_at DESC`,
+    const [categories] = await pool.execute(
+      `SELECT DISTINCT category 
+       FROM products 
+       WHERE company_id = ? AND category IS NOT NULL AND category != ''
+       ORDER BY category`,
       [req.user.company_id]
     );
-    res.json(orders);
-  } catch (error) {
-    handleDatabaseError(error, res, 'Erreur lors de la récupération des commandes fournisseurs');
-  }
-});
-
-// Créer une commande fournisseur
-app.post('/api/supplier-orders', authenticateToken, async (req, res) => {
-  try {
-    const { supplier_id, product_name, amount, purchase_date, due_date, payment_method } = req.body;
     
-    if (!supplier_id || !product_name || !amount) {
-      return res.status(400).json({ error: 'Champs obligatoires manquants' });
-    }
-
-    const [result] = await pool.execute(
-      `INSERT INTO supplier_orders (company_id, supplier_id, product_name, amount, purchase_date, due_date, payment_method) 
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [req.user.company_id, supplier_id, product_name, amount, purchase_date, due_date, payment_method]
-    );
-
-    await logActivity(req.user.company_id, req.user.id, 'supplier_order_created', 'supplier_order', result.insertId, 
-      { product_name, amount }, req.ip);
-
-    res.json({ message: 'Commande fournisseur créée avec succès', orderId: result.insertId });
+    const categoryList = categories.map(row => row.category);
+    res.json(categoryList);
   } catch (error) {
-    handleDatabaseError(error, res, 'Erreur lors de la création de la commande fournisseur');
-  }
-});
-
-// Modifier le statut d'une commande fournisseur
-app.put('/api/supplier-orders/:id', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status } = req.body;
-
-    await pool.execute(
-      `UPDATE supplier_orders SET status = ?, updated_at = NOW()
-       WHERE id = ? AND company_id = ?`,
-      [status, id, req.user.company_id]
-    );
-
-    await logActivity(req.user.company_id, req.user.id, 'supplier_order_status_updated', 'supplier_order', id, 
-      { status }, req.ip);
-
-    res.json({ message: 'Statut de la commande modifié avec succès' });
-  } catch (error) {
-    handleDatabaseError(error, res, 'Erreur lors de la modification du statut');
-  }
-});
-
-// Supprimer une commande fournisseur
-app.delete('/api/supplier-orders/:id', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    await pool.execute(
-      'DELETE FROM supplier_orders WHERE id = ? AND company_id = ?',
-      [id, req.user.company_id]
-    );
-
-    await logActivity(req.user.company_id, req.user.id, 'supplier_order_deleted', 'supplier_order', id, 
-      {}, req.ip);
-
-    res.json({ message: 'Commande fournisseur supprimée avec succès' });
-  } catch (error) {
-    handleDatabaseError(error, res, 'Erreur lors de la suppression de la commande');
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des catégories');
   }
 });
 
@@ -1906,6 +2016,203 @@ app.get('/api/debug/user-info', authenticateToken, async (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+// Route pour ajouter un paiement partiel fournisseur
+// ===============================================
+// ROUTES SUPPLIER ORDERS (COMMANDES/DETTES FOURNISSEURS)
+// ===============================================
+
+// 1️⃣ ROUTE SPÉCIFIQUE: Récupérer les dettes soldées (DOIT ÊTRE EN PREMIER)
+app.get('/api/supplier-orders/paid', authenticateToken, async (req, res) => {
+  try {
+    const [orders] = await pool.execute(
+      `SELECT so.*, s.name as supplier_name 
+       FROM supplier_orders so
+       JOIN suppliers s ON so.supplier_id = s.id
+       WHERE so.company_id = ? AND so.status = 'paid'
+       ORDER BY so.updated_at DESC
+       LIMIT 100`,
+      [req.user.company_id]
+    );
+    res.json(orders);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des dettes soldées');
+  }
+});
+
+// 2️⃣ Récupérer toutes les commandes fournisseurs
+app.get('/api/supplier-orders', authenticateToken, async (req, res) => {
+  try {
+    const [orders] = await pool.execute(
+      `SELECT so.*, s.name as supplier_name 
+       FROM supplier_orders so
+       JOIN suppliers s ON so.supplier_id = s.id
+       WHERE so.company_id = ? 
+       ORDER BY so.due_date ASC, so.created_at DESC`,
+      [req.user.company_id]
+    );
+    res.json(orders);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des commandes fournisseurs');
+  }
+});
+
+// 3️⃣ Créer une commande fournisseur
+app.post('/api/supplier-orders', authenticateToken, async (req, res) => {
+  try {
+    const { supplier_id, product_name, amount, purchase_date, due_date, payment_method } = req.body;
+    
+    if (!supplier_id || !product_name || !amount) {
+      return res.status(400).json({ error: 'Champs obligatoires manquants' });
+    }
+
+    const [result] = await pool.execute(
+      `INSERT INTO supplier_orders (company_id, supplier_id, product_name, amount, remaining_amount, paid_amount, purchase_date, due_date, payment_method)
+       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+      [req.user.company_id, supplier_id, product_name, amount, amount, purchase_date, due_date, payment_method]
+    );
+
+    await logActivity(req.user.company_id, req.user.id, 'supplier_order_created', 'supplier_order', result.insertId,
+      { product_name, amount }, req.ip);
+
+    res.json({ message: 'Commande fournisseur créée avec succès', orderId: result.insertId });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la création de la commande fournisseur');
+  }
+});
+
+// 4️⃣ ROUTE AVEC PARAMÈTRE: Ajouter un paiement partiel
+app.post('/api/supplier-orders/:id/payments', authenticateToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  
+  try {
+    const { id } = req.params;
+    const { amount, payment_date, payment_method, note } = req.body;
+
+    if (!amount || parseFloat(amount) <= 0) {
+      return res.status(400).json({ error: 'Montant invalide' });
+    }
+
+    await connection.beginTransaction();
+
+    const [orders] = await connection.execute(
+      'SELECT * FROM supplier_orders WHERE id = ? AND company_id = ?',
+      [id, req.user.company_id]
+    );
+
+    if (orders.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Commande non trouvée' });
+    }
+
+    const order = orders[0];
+    const paymentAmount = parseFloat(amount);
+    const currentRemaining = parseFloat(order.remaining_amount || order.amount);
+    const currentPaid = parseFloat(order.paid_amount || 0);
+
+    if (paymentAmount > currentRemaining) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Montant supérieur au restant' });
+    }
+
+    await connection.execute(
+      `INSERT INTO supplier_order_payments (order_id, payment_amount, payment_date, payment_method, note, created_by)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, paymentAmount, payment_date, payment_method, note, req.user.id]
+    );
+
+    const newPaidAmount = currentPaid + paymentAmount;
+    const newRemainingAmount = currentRemaining - paymentAmount;
+    const newStatus = newRemainingAmount <= 0.01 ? 'paid' : 'pending';
+
+    await connection.execute(
+      `UPDATE supplier_orders 
+       SET paid_amount = ?, remaining_amount = ?, status = ?, updated_at = NOW()
+       WHERE id = ?`,
+      [newPaidAmount, newRemainingAmount, newStatus, id]
+    );
+
+    await connection.commit();
+    
+    await logActivity(req.user.company_id, req.user.id, 'supplier_order_payment_added', 'supplier_order', id,
+      { amount: paymentAmount, remaining: newRemainingAmount }, req.ip);
+    
+    res.json({ 
+      message: 'Paiement enregistré avec succès', 
+      remaining_amount: newRemainingAmount,
+      status: newStatus
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('Erreur paiement fournisseur:', error);
+    handleDatabaseError(error, res, 'Erreur lors de l\'enregistrement du paiement');
+  } finally {
+    connection.release();
+  }
+});
+
+// 5️⃣ Récupérer l'historique des paiements d'une commande
+app.get('/api/supplier-orders/:id/payments', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const [payments] = await pool.execute(
+      `SELECT sop.*, u.full_name as created_by_name
+       FROM supplier_order_payments sop
+       LEFT JOIN users u ON sop.created_by = u.id
+       WHERE sop.order_id = ?
+       ORDER BY sop.payment_date DESC, sop.created_at DESC`,
+      [id]
+    );
+    
+    res.json(payments);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération de l\'historique des paiements');
+  }
+});
+
+// 6️⃣ Modifier le statut d'une commande fournisseur
+app.put('/api/supplier-orders/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    await pool.execute(
+      `UPDATE supplier_orders SET status = ?, updated_at = NOW()
+       WHERE id = ? AND company_id = ?`,
+      [status, id, req.user.company_id]
+    );
+
+    await logActivity(req.user.company_id, req.user.id, 'supplier_order_status_updated', 'supplier_order', id,
+      { status }, req.ip);
+
+    res.json({ message: 'Statut de la commande modifié avec succès' });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la modification du statut');
+  }
+});
+
+// 7️⃣ Supprimer une commande fournisseur
+app.delete('/api/supplier-orders/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await pool.execute(
+      'DELETE FROM supplier_orders WHERE id = ? AND company_id = ?',
+      [id, req.user.company_id]
+    );
+
+    await logActivity(req.user.company_id, req.user.id, 'supplier_order_deleted', 'supplier_order', id,
+      {}, req.ip);
+
+    res.json({ message: 'Commande fournisseur supprimée avec succès' });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la suppression de la commande');
+  }
+});
+
+// Route: Récupérer les dettes soldées
+
 // Middleware de gestion d'erreurs global
 app.use((error, req, res, next) => {
   console.error('Erreur non gérée:', error);
