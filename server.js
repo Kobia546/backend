@@ -1938,6 +1938,24 @@ app.get('/api/reports/activity-logs', authenticateToken, requireAdmin, async (re
     handleDatabaseError(error, res, 'Erreur lors de la récupération des logs d\'activité');
   }
 });
+app.get('/api/company/info', authenticateToken, async (req, res) => {
+  try {
+    const [companies] = await query(
+      `SELECT name, address, phone, email, website, siret, logo_url 
+       FROM companies 
+       WHERE id = ?`,
+      [req.user.company_id]
+    );
+
+    if (companies.length === 0) {
+      return res.status(404).json({ error: 'Entreprise non trouvée' });
+    }
+
+    res.json(companies[0]);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des informations entreprise');
+  }
+});
 
 app.get('/api/reports/company-stats', authenticateToken, async (req, res) => {
   try {
@@ -1991,6 +2009,104 @@ app.get('/api/reports/company-stats', authenticateToken, async (req, res) => {
 
   } catch (error) {
     handleDatabaseError(error, res, 'Erreur lors de la récupération des statistiques');
+  }
+});
+
+app.post('/api/client-orders/:id/record-payment-as-sale', authenticateToken, async (req, res) => {
+  const connection = await getConnection();
+  
+  try {
+    const { id } = req.params;
+    const { payment_amount, payment_method, customer_name, customer_phone } = req.body;
+
+    await connection.beginTransaction();
+
+    // Récupérer la commande et ses articles
+    const [orders] = await connection.execute(
+      `SELECT co.*, c.name as client_name, c.phone as client_phone
+       FROM client_orders co
+       JOIN clients c ON co.client_id = c.id
+       WHERE co.id = ? AND co.company_id = ?`,
+      [id, req.user.company_id]
+    );
+
+    if (orders.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Commande non trouvée' });
+    }
+
+    const order = orders[0];
+
+    // Récupérer les articles de la commande
+    const [items] = await connection.execute(
+      `SELECT * FROM client_order_items WHERE order_id = ?`,
+      [id]
+    );
+
+    // Créer une vente partielle proportionnelle au paiement
+    const paymentRatio = parseFloat(payment_amount) / parseFloat(order.total_amount);
+    const saleNumber = `SALE-CLIENT-${Date.now()}-${req.user.id}`;
+    
+    const [saleResult] = await connection.execute(
+      `INSERT INTO sales (company_id, sale_number, customer_name, customer_phone,
+       subtotal, discount, total_amount, total_profit, payment_method, seller_id)
+       VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, ?)`,
+      [
+        req.user.company_id,
+        saleNumber,
+        customer_name || order.client_name,
+        customer_phone || order.client_phone,
+        payment_amount,
+        payment_amount,
+        payment_method || 'cash',
+        req.user.id
+      ]
+    );
+
+    const saleId = saleResult.insertId;
+
+    // Ajouter les articles proportionnellement
+    for (const item of items) {
+      const proportionalQty = Math.ceil(item.quantity * paymentRatio);
+      
+      await connection.execute(
+        `INSERT INTO sale_items (sale_id, product_id, product_name, quantity,
+         unit_price, unit_cost, line_total, line_profit)
+         VALUES (?, ?, ?, ?, ?, 0, ?, 0)`,
+        [
+          saleId,
+          item.product_id,
+          item.product_name,
+          proportionalQty,
+          item.unit_price,
+          item.unit_price * proportionalQty
+        ]
+      );
+    }
+
+    await connection.commit();
+
+    await logActivity(
+      req.user.company_id,
+      req.user.id,
+      'client_payment_recorded_as_sale',
+      'sale',
+      saleId,
+      { payment_amount, order_id: id, saleNumber },
+      req.ip
+    );
+
+    res.json({ 
+      message: 'Paiement enregistré comme vente',
+      saleId,
+      saleNumber
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    handleDatabaseError(error, res, 'Erreur lors de l\'enregistrement du paiement');
+  } finally {
+    connection.release();
   }
 });
 
