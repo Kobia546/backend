@@ -767,6 +767,409 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ================================================
+// ROUTES API: Gestion des produits avariés
+// À ajouter dans ton fichier server.js
+// ================================================
+
+// 📦 Déclarer un produit comme avarié (réduire le stock disponible)
+app.post('/api/products/:id/mark-damaged', authenticateToken, async (req, res) => {
+  const connection = await getConnection();
+  
+  try {
+    const { id } = req.params;
+    const { damaged_quantity, reason, damaged_date } = req.body;
+
+    // Validation
+    if (!damaged_quantity || damaged_quantity <= 0) {
+      return res.status(400).json({ error: 'Quantité avariée invalide' });
+    }
+
+    await connection.beginTransaction();
+
+    // Récupérer le produit actuel
+    const [products] = await connection.execute(
+      `SELECT id, name, current_stock, damaged_stock, purchase_price, company_id 
+       FROM products 
+       WHERE id = ? AND company_id = ?`,
+      [id, req.user.company_id]
+    );
+
+    if (products.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Produit non trouvé' });
+    }
+
+    const product = products[0];
+
+    // Vérifier qu'il y a assez de stock disponible
+    if (product.current_stock < damaged_quantity) {
+      await connection.rollback();
+      return res.status(400).json({ 
+        error: `Stock insuffisant. Stock disponible: ${product.current_stock}` 
+      });
+    }
+
+    // Mettre à jour le stock
+    await connection.execute(
+      `UPDATE products 
+       SET current_stock = current_stock - ?,
+           damaged_stock = damaged_stock + ?,
+           updated_at = NOW()
+       WHERE id = ? AND company_id = ?`,
+      [damaged_quantity, damaged_quantity, id, req.user.company_id]
+    );
+
+    // Enregistrer dans l'historique
+    const [historyResult] = await connection.execute(
+      `INSERT INTO damaged_products_history 
+       (company_id, product_id, product_name, quantity, reason, damaged_date, reported_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.user.company_id,
+        product.id,
+        product.name,
+        damaged_quantity,
+        reason || 'Non spécifié',
+        damaged_date || new Date().toISOString().split('T')[0],
+        req.user.id
+      ]
+    );
+
+    await connection.commit();
+
+    // Log de l'activité
+    await logActivity(
+      req.user.company_id,
+      req.user.id,
+      'product_marked_damaged',
+      'product',
+      product.id,
+      { 
+        product_name: product.name,
+        damaged_quantity,
+        reason,
+        loss_value: (damaged_quantity * product.purchase_price).toFixed(2)
+      },
+      req.ip
+    );
+
+    res.json({ 
+      message: 'Produit marqué comme avarié',
+      product_id: product.id,
+      product_name: product.name,
+      damaged_quantity,
+      new_available_stock: product.current_stock - damaged_quantity,
+      new_damaged_stock: product.damaged_stock + damaged_quantity,
+      estimated_loss: (damaged_quantity * product.purchase_price).toFixed(2)
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    handleDatabaseError(error, res, 'Erreur lors de la déclaration du produit avarié');
+  } finally {
+    connection.release();
+  }
+});
+
+// 📊 Récupérer l'historique des produits avariés
+app.get('/api/damaged-products/history', authenticateToken, async (req, res) => {
+  try {
+    const { start_date, end_date, product_id } = req.query;
+    
+    let whereClause = 'WHERE dph.company_id = ?';
+    let params = [req.user.company_id];
+
+    if (start_date) {
+      whereClause += ' AND dph.damaged_date >= ?';
+      params.push(start_date);
+    }
+
+    if (end_date) {
+      whereClause += ' AND dph.damaged_date <= ?';
+      params.push(end_date);
+    }
+
+    if (product_id) {
+      whereClause += ' AND dph.product_id = ?';
+      params.push(product_id);
+    }
+
+    const [history] = await query(
+      `SELECT 
+        dph.id,
+        dph.product_id,
+        dph.product_name,
+        dph.quantity,
+        dph.reason,
+        dph.damaged_date,
+        dph.created_at,
+        u.username as reported_by,
+        p.purchase_price,
+        (dph.quantity * p.purchase_price) as loss_value
+       FROM damaged_products_history dph
+       LEFT JOIN users u ON dph.reported_by = u.id
+       LEFT JOIN products p ON dph.product_id = p.id
+       ${whereClause}
+       ORDER BY dph.damaged_date DESC, dph.created_at DESC
+       LIMIT 500`,
+      params
+    );
+
+    res.json(history);
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération de l\'historique');
+  }
+});
+
+// 📈 Statistiques sur les produits avariés
+app.get('/api/damaged-products/stats', authenticateToken, async (req, res) => {
+  try {
+    const { period = '30' } = req.query; // Période en jours
+
+    const [stats] = await query(
+      `SELECT 
+        COUNT(DISTINCT dph.product_id) as products_affected,
+        SUM(dph.quantity) as total_damaged_quantity,
+        SUM(dph.quantity * p.purchase_price) as total_loss_value,
+        COUNT(dph.id) as total_incidents,
+        AVG(dph.quantity) as avg_quantity_per_incident
+       FROM damaged_products_history dph
+       LEFT JOIN products p ON dph.product_id = p.id
+       WHERE dph.company_id = ?
+         AND dph.damaged_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`,
+      [req.user.company_id, period]
+    );
+
+    // Top 5 des produits les plus avariés
+    const [topDamaged] = await query(
+      `SELECT 
+        p.id,
+        p.name,
+        p.category,
+        SUM(dph.quantity) as total_damaged,
+        SUM(dph.quantity * p.purchase_price) as total_loss,
+        COUNT(dph.id) as incident_count
+       FROM damaged_products_history dph
+       JOIN products p ON dph.product_id = p.id
+       WHERE dph.company_id = ?
+         AND dph.damaged_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       GROUP BY p.id, p.name, p.category
+       ORDER BY total_damaged DESC
+       LIMIT 5`,
+      [req.user.company_id, period]
+    );
+
+    // Produits actuellement avec stock avarié
+    const [currentDamaged] = await query(
+      `SELECT 
+        id,
+        name,
+        category,
+        current_stock,
+        damaged_stock,
+        (current_stock + damaged_stock) as original_stock,
+        purchase_price,
+        (damaged_stock * purchase_price) as current_loss_value,
+        ROUND((damaged_stock / NULLIF(current_stock + damaged_stock, 0)) * 100, 2) as damage_rate
+       FROM products
+       WHERE company_id = ?
+         AND damaged_stock > 0
+       ORDER BY damaged_stock DESC
+       LIMIT 10`,
+      [req.user.company_id]
+    );
+
+    res.json({
+      summary: stats[0],
+      top_damaged_products: topDamaged,
+      current_damaged_inventory: currentDamaged
+    });
+  } catch (error) {
+    handleDatabaseError(error, res, 'Erreur lors de la récupération des statistiques');
+  }
+});
+
+// 🔄 Restaurer un produit avarié (si erreur de saisie)
+app.post('/api/products/:id/restore-damaged', authenticateToken, async (req, res) => {
+  const connection = await getConnection();
+  
+  try {
+    const { id } = req.params;
+    const { restore_quantity, reason } = req.body;
+
+    if (!restore_quantity || restore_quantity <= 0) {
+      return res.status(400).json({ error: 'Quantité à restaurer invalide' });
+    }
+
+    await connection.beginTransaction();
+
+    // Récupérer le produit
+    const [products] = await connection.execute(
+      `SELECT id, name, damaged_stock, current_stock 
+       FROM products 
+       WHERE id = ? AND company_id = ?`,
+      [id, req.user.company_id]
+    );
+
+    if (products.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Produit non trouvé' });
+    }
+
+    const product = products[0];
+
+    if (product.damaged_stock < restore_quantity) {
+      await connection.rollback();
+      return res.status(400).json({ 
+        error: `Stock avarié insuffisant. Stock avarié actuel: ${product.damaged_stock}` 
+      });
+    }
+
+    // Restaurer le stock
+    await connection.execute(
+      `UPDATE products 
+       SET current_stock = current_stock + ?,
+           damaged_stock = damaged_stock - ?,
+           updated_at = NOW()
+       WHERE id = ? AND company_id = ?`,
+      [restore_quantity, restore_quantity, id, req.user.company_id]
+    );
+
+    // Enregistrer la correction dans l'historique (quantité négative)
+    await connection.execute(
+      `INSERT INTO damaged_products_history 
+       (company_id, product_id, product_name, quantity, reason, damaged_date, reported_by)
+       VALUES (?, ?, ?, ?, ?, CURDATE(), ?)`,
+      [
+        req.user.company_id,
+        product.id,
+        product.name,
+        -restore_quantity, // Négatif pour indiquer une restauration
+        `RESTAURATION: ${reason || 'Correction d\'erreur'}`,
+        req.user.id
+      ]
+    );
+
+    await connection.commit();
+
+    await logActivity(
+      req.user.company_id,
+      req.user.id,
+      'damaged_product_restored',
+      'product',
+      product.id,
+      { 
+        product_name: product.name,
+        restored_quantity: restore_quantity,
+        reason
+      },
+      req.ip
+    );
+
+    res.json({ 
+      message: 'Stock avarié restauré',
+      product_name: product.name,
+      restored_quantity: restore_quantity,
+      new_available_stock: product.current_stock + restore_quantity,
+      new_damaged_stock: product.damaged_stock - restore_quantity
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    handleDatabaseError(error, res, 'Erreur lors de la restauration du stock');
+  } finally {
+    connection.release();
+  }
+});
+
+// 🗑️ Supprimer définitivement le stock avarié (après destruction physique)
+app.post('/api/products/:id/remove-damaged', authenticateToken, async (req, res) => {
+  const connection = await getConnection();
+  
+  try {
+    const { id } = req.params;
+    const { removal_note } = req.body;
+
+    await connection.beginTransaction();
+
+    const [products] = await connection.execute(
+      `SELECT id, name, damaged_stock, purchase_price 
+       FROM products 
+       WHERE id = ? AND company_id = ?`,
+      [id, req.user.company_id]
+    );
+
+    if (products.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Produit non trouvé' });
+    }
+
+    const product = products[0];
+
+    if (product.damaged_stock <= 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Aucun stock avarié à supprimer' });
+    }
+
+    const removedQuantity = product.damaged_stock;
+    const finalLoss = removedQuantity * product.purchase_price;
+
+    // Mettre à jour: remettre damaged_stock à 0
+    await connection.execute(
+      `UPDATE products 
+       SET damaged_stock = 0,
+           updated_at = NOW()
+       WHERE id = ? AND company_id = ?`,
+      [id, req.user.company_id]
+    );
+
+    // Enregistrer la suppression définitive
+    await connection.execute(
+      `INSERT INTO damaged_products_history 
+       (company_id, product_id, product_name, quantity, reason, damaged_date, reported_by)
+       VALUES (?, ?, ?, ?, ?, CURDATE(), ?)`,
+      [
+        req.user.company_id,
+        product.id,
+        product.name,
+        removedQuantity,
+        `DESTRUCTION DÉFINITIVE: ${removal_note || 'Stock avarié éliminé'}`,
+        req.user.id
+      ]
+    );
+
+    await connection.commit();
+
+    await logActivity(
+      req.user.company_id,
+      req.user.id,
+      'damaged_stock_removed',
+      'product',
+      product.id,
+      { 
+        product_name: product.name,
+        removed_quantity: removedQuantity,
+        final_loss: finalLoss.toFixed(2),
+        note: removal_note
+      },
+      req.ip
+    );
+
+    res.json({ 
+      message: 'Stock avarié supprimé définitivement',
+      product_name: product.name,
+      removed_quantity: removedQuantity,
+      final_loss: finalLoss.toFixed(2)
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    handleDatabaseError(error, res, 'Erreur lors de la suppression du stock avarié');
+  } finally {
+    connection.release();
+  }
+});
 app.get('/api/products/categories', authenticateToken, async (req, res) => {
   try {
     const [categories] = await query(
